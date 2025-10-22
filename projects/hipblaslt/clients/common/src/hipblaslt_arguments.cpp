@@ -68,6 +68,10 @@ void Arguments::init()
     iters      = 10;
     cold_iters = 2;
 
+    bench_time      = 0.f;
+    cold_bench_time = 0.f;
+    remove_outliers = false;
+
     algo                   = 0;
     solution_index         = -1;
     requested_solution_num = 1;
