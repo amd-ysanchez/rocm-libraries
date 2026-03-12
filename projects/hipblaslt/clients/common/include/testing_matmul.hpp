@@ -82,6 +82,7 @@ bool isSwizzleSupported(hipDataType datatype)
     case HIP_R_16BF:
     case HIP_R_16F:
     case HIP_R_8F_E4M3_FNUZ:
+    case HIP_R_4F_E2M1_EXT:
         return true;
     default:
         return false;
@@ -97,6 +98,8 @@ hipblasLtOrder_t orderForDatatype(hipDataType datatype)
         return HIPBLASLT_ORDER_COL16_4R8;
     case HIP_R_8F_E4M3_FNUZ:
         return HIPBLASLT_ORDER_COL16_4R16;
+    case HIP_R_4F_E2M1_EXT:
+        return HIPBLASLT_ORDER_COL16_4R32;
     default:
         throw std::runtime_error("unsupported datatype in orderForDatatype");
     }
@@ -134,6 +137,12 @@ void calculateKforSwizzling(
     case HIP_R_8F_E4M3:
     case HIP_R_8F_E5M2:
         MiK  = 32;
+        MiKv = 8;
+        break;
+    case HIP_R_4F_E2M1_EXT:
+        // For fp4 viewed as uint8: matches shuffle_weight with layout=(16,16)
+        // BK=32 bytes, K=16 bytes, BK/K=2
+        MiK  = 16;  // K inner block = 16 bytes
         MiKv = 8;
         break;
     default:
@@ -248,6 +257,11 @@ void swizzle_tensor_type(HipHostBuffer&       dst,
     case HIP_R_8F_E5M2:
         swizzle_tensor<hipblaslt_bf8>(
             dst.as<hipblaslt_bf8>(), src.as<hipblaslt_bf8>(), datatype, arg, b, m_n, k, ld, colMaj);
+        return;
+    case HIP_R_4F_E2M1_EXT:
+        // fp4: 2 elements per byte, so k_bytes = k/2, ld_bytes = ld/2
+        swizzle_tensor<uint8_t>(
+            dst.as<uint8_t>(), src.as<uint8_t>(), datatype, arg, b, m_n, k/2, ld/2, colMaj);
         return;
     default:
         hipblaslt_cerr << "Error type in swizzle_tensor_type()" << std::endl;
@@ -815,6 +829,10 @@ auto _relu = [](auto in, auto /*arg1*/, auto /*arg2*/) -> decltype(in) {
     return static_cast<decltype(in)>(std::max(static_cast<decltype(in)>(0), in));
 };
 
+auto _drelu = [](auto in, auto /*arg1*/, auto /*arg2*/) -> decltype(in) {
+    return static_cast<decltype(in)>(in > static_cast<decltype(in)>(0) ? 1 : 0);
+};
+
 auto _gelu = [](auto in, auto /*arg1*/, auto /*arg2*/) -> decltype(in) {
     using Tc = float;
 
@@ -859,7 +877,8 @@ auto _clamp = [](auto in, auto alpha, auto beta) -> decltype(in) {
 };
 
 auto _sigmoid = [](auto in, auto /*arg1*/, auto /*arg2*/) -> decltype(in) {
-    return static_cast<decltype(in)>(static_cast<decltype(in)>(1)/(static_cast<decltype(in)>(1) + std::exp(-in)));
+    return static_cast<decltype(in)>(static_cast<decltype(in)>(1)
+                                     / (static_cast<decltype(in)>(1) + std::exp(-in)));
 };
 
 void testing_matmul_bad_arg(const Arguments& arg)
@@ -1494,9 +1513,9 @@ void testing_matmul_with_bias(const Arguments& arg,
         stride_d[i] = do_batched[i] ? arg.stride_c[i] : ldd[i] * N[i];
         stride_e[i] = do_batched[i] ? arg.stride_e[i] : lde[i] * N[i];
 
-        size_A[i]
-            = stride_a[i] == 0 ? lda[i] * A_col[i] * num_batches[i]
-                               : lda[i] <= stride_a[i] ? stride_a[i] * num_batches[i] : lda[i] * A_col[i];
+        size_A[i] = stride_a[i] == 0        ? lda[i] * A_col[i] * num_batches[i]
+                    : lda[i] <= stride_a[i] ? stride_a[i] * num_batches[i]
+                                            : lda[i] * A_col[i];
         // for (!do_swizzle_a) case, we can use size_dA and stride_da instead of size_A and stride_a
         size_dA[i]   = size_A[i];
         stride_da[i] = stride_a[i];
@@ -1519,9 +1538,9 @@ void testing_matmul_with_bias(const Arguments& arg,
             size_dA[i] = num_batches[i] * stride_swizzle;
         }
 
-        size_B[i]
-            = stride_b[i] == 0 ? ldb[i] * B_col[i] * num_batches[i]
-                               : ldb[i] <= stride_b[i] ? stride_b[i] * num_batches[i] : ldb[i] * B_col[i];
+        size_B[i] = stride_b[i] == 0        ? ldb[i] * B_col[i] * num_batches[i]
+                    : ldb[i] <= stride_b[i] ? stride_b[i] * num_batches[i]
+                                            : ldb[i] * B_col[i];
         // for (!do_swizzle_b) case, we can use size_dB and stride_db instead of size_B and stride_b
         size_dB[i]   = size_B[i];
         stride_db[i] = stride_b[i];
@@ -1543,14 +1562,15 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
             size_dB[i] = num_batches[i] * stride_swizzle;
         }
-        size_C[i]
-            = stride_c[i] == 0 ? ldc[i] * N[i] * num_batches[i]
-                               : ldc[i] <= stride_c[i] ? stride_c[i] * num_batches[i] : ldc[i] * N[i];
-        size_D[i]
-            = stride_d[i] == 0 ? ldd[i] * N[i] * num_batches[i]
-                               : ldd[i] <= stride_d[i] ? stride_d[i] * num_batches[i] : ldd[i] * N[i];
-        size_E[i] = arg.use_e ? (stride_e[i] == 0 ? lde[i] * N[i] * num_batches[i]
-                                                  : lde[i] <= stride_e[i] ? stride_e[i] * num_batches[i] : lde[i] * N[i])
+        size_C[i] = stride_c[i] == 0        ? ldc[i] * N[i] * num_batches[i]
+                    : ldc[i] <= stride_c[i] ? stride_c[i] * num_batches[i]
+                                            : ldc[i] * N[i];
+        size_D[i] = stride_d[i] == 0        ? ldd[i] * N[i] * num_batches[i]
+                    : ldd[i] <= stride_d[i] ? stride_d[i] * num_batches[i]
+                                            : ldd[i] * N[i];
+        size_E[i] = arg.use_e ? (stride_e[i] == 0        ? lde[i] * N[i] * num_batches[i]
+                                 : lde[i] <= stride_e[i] ? stride_e[i] * num_batches[i]
+                                                         : lde[i] * N[i])
                               : 0;
         if(arg.c_equal_d)
         {
@@ -1565,16 +1585,16 @@ void testing_matmul_with_bias(const Arguments& arg,
             size_scaleAVec[i] = 1;
         else if(arg.scaleA == hipblaslt_scaling_format::Vector)
             size_scaleAVec[i] = M[i];
-        else if(arg.scaleA == hipblaslt_scaling_format::Block)
-            size_scaleAVec[i] = (M[i] * K[i]) / (arg.scaleABlockRowSize * arg.scaleABlockColSize);
+        else if(isBlockScaling(arg.scaleA))
+            size_scaleAVec[i] = scaleBufferSize(A_row[i], A_col[i], arg.scaleA);
         else
             size_scaleAVec[i] = 0;
         if(arg.scaleB == hipblaslt_scaling_format::Scalar)
             size_scaleBVec[i] = 1;
         else if(arg.scaleB == hipblaslt_scaling_format::Vector)
             size_scaleBVec[i] = N[i];
-        else if(arg.scaleB == hipblaslt_scaling_format::Block)
-            size_scaleBVec[i] = (K[i] * N[i]) / (arg.scaleBBlockRowSize * arg.scaleBBlockColSize);
+        else if(isBlockScaling(arg.scaleB))
+            size_scaleBVec[i] = scaleBufferSize(B_row[i], B_col[i], arg.scaleB);
         else
             size_scaleBVec[i] = 0;
         if(arg.bias_vector)
@@ -1782,6 +1802,14 @@ void testing_matmul_with_bias(const Arguments& arg,
                 CHECK_SUCCESS(arg.use_e && "Must enable use e if gradient is enabled with gelu.");
                 epilogue[i] = HIPBLASLT_EPILOGUE_DGELU_BGRAD;
                 break;
+            case HIPBLASLT_EPILOGUE_RELU:
+                CHECK_SUCCESS(arg.use_e && "Must enable use e if gradient is enabled with relu.");
+                epilogue[i] = HIPBLASLT_EPILOGUE_DRELU;
+                break;
+            case HIPBLASLT_EPILOGUE_RELU_BIAS:
+                CHECK_SUCCESS(arg.use_e && "Must enable use e if gradient is enabled with relu.");
+                epilogue[i] = HIPBLASLT_EPILOGUE_DRELU_BGRAD;
+                break;
             default:
                 break;
             }
@@ -1811,6 +1839,10 @@ void testing_matmul_with_bias(const Arguments& arg,
             case HIPBLASLT_EPILOGUE_DGELU:
             case HIPBLASLT_EPILOGUE_DGELU_BGRAD:
                 // DGELU_AUX and DGELU_AUX_BGRAD already use E
+                break;
+            case HIPBLASLT_EPILOGUE_DRELU:
+            case HIPBLASLT_EPILOGUE_DRELU_BGRAD:
+                // DRELU_AUX and DRELU_AUX_BGRAD already use E
                 break;
             default:
                 hipblaslt_cerr << "The activation type " << epilogue[i]
@@ -1866,7 +1898,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             dScaleA.emplace_back(Talpha, size_scaleAVec[i] * block_count, HMM);
             CHECK_DEVICE_ALLOCATION(hipGetLastError());
         }
-        else if(arg.scaleA == hipblaslt_scaling_format::Block)
+        else if(isBlockScaling(arg.scaleA))
         {
             // For MX format, use uin8_t for the scale (E8M0)
             dScaleA.emplace_back(HIP_R_8U, size_scaleAVec[i] * block_count, HMM);
@@ -1878,7 +1910,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             dScaleB.emplace_back(Talpha, size_scaleBVec[i] * block_count, HMM);
             CHECK_DEVICE_ALLOCATION(hipGetLastError());
         }
-        else if(arg.scaleB == hipblaslt_scaling_format::Block)
+        else if(isBlockScaling(arg.scaleB))
         {
             // For MX format, use uin8_t for the scale (E8M0)
             dScaleB.emplace_back(HIP_R_8U, size_scaleBVec[i] * block_count, HMM);
@@ -1930,7 +1962,7 @@ void testing_matmul_with_bias(const Arguments& arg,
         {
             hScaleA.emplace_back(Talpha, size_scaleAVec[i]);
         }
-        else if(arg.scaleA == hipblaslt_scaling_format::Block)
+        else if(isBlockScaling(arg.scaleA))
         {
             hScaleA.emplace_back(HIP_R_8U, size_scaleAVec[i]);
         }
@@ -1939,7 +1971,7 @@ void testing_matmul_with_bias(const Arguments& arg,
         {
             hScaleB.emplace_back(Talpha, size_scaleBVec[i]);
         }
-        else if(arg.scaleB == hipblaslt_scaling_format::Block)
+        else if(isBlockScaling(arg.scaleB))
         {
             hScaleB.emplace_back(HIP_R_8U, size_scaleBVec[i]);
         }
@@ -1967,15 +1999,15 @@ void testing_matmul_with_bias(const Arguments& arg,
         hipblaslt_seedrand();
 
 #ifdef HIPBLASLT_USE_ROCROLLER
-        if(arg.scaleA == hipblaslt_scaling_format::Block)
+        if(isBlockScaling(arg.scaleA))
         {
             if(arg.initialization != hipblaslt_initialization::hpl
                && arg.initialization != hipblaslt_initialization::trig_float
                && arg.initialization != hipblaslt_initialization::uniform_01)
             {
-                hipblaslt_cout
-                    << "Initialization of microscaling data only allows hpl, trig_float or uniform_01, not "
-                    << hipblaslt_initialization2string(arg.initialization) << std::endl;
+                hipblaslt_cout << "Initialization of microscaling data only allows hpl, trig_float "
+                                  "or uniform_01, not "
+                               << hipblaslt_initialization2string(arg.initialization) << std::endl;
                 return;
             }
             if(arg.algo_method == 1)
@@ -1988,6 +2020,10 @@ void testing_matmul_with_bias(const Arguments& arg,
             // TODO: mxDataGenerator can only generate data on CPU. Using
             //       GPU to generate data might be more efficient and avoid
             //       unnecessary hipMemCpy when CPU verification is not needed.
+
+            // preTile for A: {tileK, tileM} - swap from preTileSizeForScaleA which returns {tileM, tileK}
+            auto preTileATmp = preTileSizeForScaleA(arg.scaleA);
+            auto preTileA = (preTileATmp.size() == 2) ? std::vector<size_t>{preTileATmp[1], preTileATmp[0]} : std::vector<size_t>{};
             refA.emplace_back(generateMXInput(TiA,
                                               hA[i].buf(),
                                               hScaleA[i].buf(),
@@ -1995,8 +2031,10 @@ void testing_matmul_with_bias(const Arguments& arg,
                                               A_col[i],
                                               lda[i],
                                               transA == HIPBLAS_OP_T,
-                                              arg.scaleABlockRowSize,
-                                              arg.scaleABlockColSize,
+                                              preSwizzleSizeForScale(arg.scaleA),
+                                              preTileA,
+                                              blockSize(arg.scaleA),
+                                              1,
                                               true,
                                               hipblaslt_initialization2string(arg.initialization)));
             // Copy data and scale to device buffers
@@ -2019,15 +2057,15 @@ void testing_matmul_with_bias(const Arguments& arg,
                                   num_batches[i]);
 #ifdef HIPBLASLT_USE_ROCROLLER
         }
-        if(arg.scaleB == hipblaslt_scaling_format::Block)
+        if(isBlockScaling(arg.scaleB))
         {
             if(arg.initialization != hipblaslt_initialization::hpl
                && arg.initialization != hipblaslt_initialization::trig_float
                && arg.initialization != hipblaslt_initialization::uniform_01)
             {
-                hipblaslt_cout
-                    << "Initialization of microscaling data only allows hpl, trig_float or uniform_01, not "
-                    << hipblaslt_initialization2string(arg.initialization) << std::endl;
+                hipblaslt_cout << "Initialization of microscaling data only allows hpl, trig_float "
+                                  "or uniform_01, not "
+                               << hipblaslt_initialization2string(arg.initialization) << std::endl;
                 return;
             }
             if(arg.algo_method == 1)
@@ -2040,6 +2078,8 @@ void testing_matmul_with_bias(const Arguments& arg,
             // TODO: mxDataGenerator can only generate data on CPU. Using
             //       GPU to generate data might be more efficient and avoid
             //       unnecessary hipMemCpy when CPU verification is not needed.
+            // preTile for B: {tileK, tileN}
+            auto preTileB = preTileSizeForScaleB(arg.scaleB);
             refB.emplace_back(generateMXInput(TiB,
                                               hB[i].buf(),
                                               hScaleB[i].buf(),
@@ -2047,8 +2087,10 @@ void testing_matmul_with_bias(const Arguments& arg,
                                               B_col[i],
                                               ldb[i],
                                               transB == HIPBLAS_OP_T,
-                                              arg.scaleBBlockRowSize,
-                                              arg.scaleBBlockColSize,
+                                              preSwizzleSizeForScale(arg.scaleB),
+                                              preTileB,
+                                              1,
+                                              blockSize(arg.scaleB),
                                               false,
                                               hipblaslt_initialization2string(arg.initialization)));
             // Copy data and scale to device buffers
@@ -2110,9 +2152,27 @@ void testing_matmul_with_bias(const Arguments& arg,
 
             if(arg.dump_matrix)
             {
-                hipblasltDispatchValuesToFile(transA, TiA, M[i], K[i], lda[i], hA[i].buf(), "batch_"+ std::to_string(i)+"_A_input.txt");
-                hipblasltDispatchValuesToFile(transB, TiB, K[i], N[i], ldb[i], hB[i].buf(), "batch_"+ std::to_string(i)+"_B_input.txt");
-                hipblasltDispatchValuesToFile(HIPBLAS_OP_N, To, M[i], N[i], ldc[i], hC[i].buf(), "batch_"+ std::to_string(i)+"_C_input.txt");
+                hipblasltDispatchValuesToFile(transA,
+                                              TiA,
+                                              M[i],
+                                              K[i],
+                                              lda[i],
+                                              hA[i].buf(),
+                                              "batch_" + std::to_string(i) + "_A_input.txt");
+                hipblasltDispatchValuesToFile(transB,
+                                              TiB,
+                                              K[i],
+                                              N[i],
+                                              ldb[i],
+                                              hB[i].buf(),
+                                              "batch_" + std::to_string(i) + "_B_input.txt");
+                hipblasltDispatchValuesToFile(HIPBLAS_OP_N,
+                                              To,
+                                              M[i],
+                                              N[i],
+                                              ldc[i],
+                                              hC[i].buf(),
+                                              "batch_" + std::to_string(i) + "_C_input.txt");
             }
         }
 
@@ -2340,17 +2400,13 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
             // For MX format (SCALE_POINTER_BLOCK), set the scale mode
             // Set the row and col sizes of scale block for matrix A
-            if(arg.scaleA == hipblaslt_scaling_format::Block)
+            else if(arg.scaleA == hipblaslt_scaling_format::Block_32_UE8M0)
             {
-                if(arg.scaleABlockRowSize == 32 && arg.scaleABlockColSize == 1)
-                {
-                    mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-                }
-                else
-                {
-                    hipblaslt_cout << "Only a block size scaling of 32 is supported" << std::endl;
-                    return;
-                }
+                mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+            }
+            else if(arg.scaleA == hipblaslt_scaling_format::Block_32_UE8M0_32_8_EXT)
+            {
+                mode = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
             }
 
             if(mode != HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F)
@@ -2376,18 +2432,15 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
             // For MX format (SCALE_POINTER_BLOCK), set the scale mode
             // Set the row and col sizes of scale block for matrix B
-            if(arg.scaleB == hipblaslt_scaling_format::Block)
+            else if(arg.scaleB == hipblaslt_scaling_format::Block_32_UE8M0)
             {
-                if(arg.scaleBBlockRowSize == 1 && arg.scaleBBlockColSize == 32)
-                {
-                    mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
-                }
-                else
-                {
-                    hipblaslt_cout << "Only a block size scaling of 32 is supported" << std::endl;
-                    return;
-                }
+                mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
             }
+            else if(arg.scaleB == hipblaslt_scaling_format::Block_32_UE8M0_32_8_EXT)
+            {
+                mode = HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT;
+            }
+
             if(mode != HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F)
             {
                 auto attr = HIPBLASLT_MATMUL_DESC_B_SCALE_MODE;
@@ -3346,8 +3399,8 @@ void testing_matmul_with_bias(const Arguments& arg,
             void* scaleDValue = arg.scaleD ? hScaleD[gemmIdx].buf() : (void*)(&scale);
             void* scaleEValue = arg.scaleE ? hScaleE[gemmIdx].buf() : (void*)(&scale);
 
-            bool const isScaleAMXFormat = (arg.scaleA == hipblaslt_scaling_format::Block);
-            bool const isScaleBMXFormat = (arg.scaleB == hipblaslt_scaling_format::Block);
+            bool const isScaleAMXFormat = isBlockScaling(arg.scaleA);
+            bool const isScaleBMXFormat = isBlockScaling(arg.scaleB);
 
             for(int batchIdx = 0; batchIdx < num_batches[gemmIdx]; batchIdx++)
             {
@@ -3391,8 +3444,8 @@ void testing_matmul_with_bias(const Arguments& arg,
                         isScaleAMXFormat ? HIP_R_32F : TciA,
                         isScaleBMXFormat ? HIP_R_32F : TciB,
                         false,
-                        (arg.scaleA == hipblaslt_scaling_format::Block),
-                        (arg.scaleB == hipblaslt_scaling_format::Block));
+                        isBlockScaling(arg.scaleA),
+                        isBlockScaling(arg.scaleB));
 
                     auto                        pos    = stride_d[gemmIdx] * batchIdx;
                     std::vector<HipHostBuffer>* hEInst = arg.gradient ? &hE : &hE_gold;
@@ -3430,15 +3483,30 @@ void testing_matmul_with_bias(const Arguments& arg,
                         }
                         break;
                     case hipblaslt_activation_type::relu:
-                        epilogue_func(epilogue_param,
-                                      hBias_buf,
-                                      Tbias,
-                                      arg.activation_arg1,
-                                      arg.activation_arg2,
-                                      ::_relu,
-                                      arg.gradient,
-                                      To,
-                                      Talpha);
+                        if(arg.gradient)
+                        {
+                            epilogue_func(epilogue_param,
+                                          hBias_buf,
+                                          Tbias,
+                                          arg.activation_arg1,
+                                          arg.activation_arg2,
+                                          ::_drelu,
+                                          true,
+                                          To,
+                                          Talpha);
+                        }
+                        else
+                        {
+                            epilogue_func(epilogue_param,
+                                          hBias_buf,
+                                          Tbias,
+                                          arg.activation_arg1,
+                                          arg.activation_arg2,
+                                          ::_relu,
+                                          false,
+                                          To,
+                                          Talpha);
+                        }
                         break;
                     case hipblaslt_activation_type::swish:
                         epilogue_func(epilogue_param,
@@ -3583,8 +3651,8 @@ void testing_matmul_with_bias(const Arguments& arg,
                         isScaleAMXFormat ? HIP_R_32F : TciA,
                         isScaleBMXFormat ? HIP_R_32F : TciB,
                         false,
-                        (arg.scaleA == hipblaslt_scaling_format::Block),
-                        (arg.scaleB == hipblaslt_scaling_format::Block));
+                        isBlockScaling(arg.scaleA),
+                        isBlockScaling(arg.scaleB));
                 }
             }
         }
@@ -3753,13 +3821,29 @@ void testing_matmul_with_bias(const Arguments& arg,
         double flush_time_used = 0;
         if(arg.flush && (!arg.use_gpu_timer || !arg.remove_outliers))
         {
-            for(int i = 0; i < flush_iter; i++)
-                hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
-            flush_time_used = get_time_us_sync(stream);
-            for(int i = 0; i < flush_iter; i++)
-                hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
-            flush_time_used = get_time_us_sync(stream) - flush_time_used;
-            flush_time_used /= flush_iter;
+            static std::unordered_map<std::string, double> flush_times_cache;
+            static std::mutex                              mtx;
+            std::lock_guard<std::mutex>                    lock(mtx);
+            std::string                                    device_uuid(deviceProps.uuid.bytes);
+            if(!flush_times_cache.count(device_uuid))
+            {
+                for(int i = 0; i < flush_iter; i++)
+                    hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
+                pre_gpu_time(arg.use_gpu_timer, event_gpu_time_start, flush_time_used, stream);
+                for(int i = 0; i < flush_iter; i++)
+                    hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
+                post_gpu_time(arg.use_gpu_timer,
+                              event_gpu_time_start,
+                              event_gpu_time_end,
+                              flush_time_used,
+                              stream);
+                flush_time_used /= flush_iter;
+                flush_times_cache[device_uuid] = flush_time_used;
+            }
+            else
+            {
+                flush_time_used = flush_times_cache[device_uuid];
+            }
         }
 
         auto copy_to_host = [&](int i) {
@@ -3794,7 +3878,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
             if(!do_grouped_gemm)
             {
-                EfficiencyMonitor& perf_monitor = getEfficiencyMonitor();
+                auto perf_monitor = EfficiencyMonitor::create();
                 if(arg.use_ext)
                 {
                     for(int32_t b = 0; b < block_count; b++)
@@ -3891,7 +3975,7 @@ void testing_matmul_with_bias(const Arguments& arg,
             }
             else
             {
-                EfficiencyMonitor& perf_monitor = getEfficiencyMonitor();
+                auto perf_monitor = EfficiencyMonitor::create();
                 if(arg.use_user_args)
                 {
                     std::vector<unsigned char*> d_userArgsVec(block_count);
@@ -4024,8 +4108,20 @@ void testing_matmul_with_bias(const Arguments& arg,
             {
                 if(arg.dump_matrix)
                 {
-                    hipblasltDispatchValuesToFile(HIPBLAS_OP_N, To, M[0], N[0], ldd[0], hD_1[0].buf(), "batch_0_D_output.txt");
-                    hipblasltDispatchValuesToFile(HIPBLAS_OP_N, To, M[0], N[0], ldd[0], hD_gold[0].buf(), "batch_0_D_Gold_output.txt");
+                    hipblasltDispatchValuesToFile(HIPBLAS_OP_N,
+                                                  To,
+                                                  M[0],
+                                                  N[0],
+                                                  ldd[0],
+                                                  hD_1[0].buf(),
+                                                  "batch_0_D_output.txt");
+                    hipblasltDispatchValuesToFile(HIPBLAS_OP_N,
+                                                  To,
+                                                  M[0],
+                                                  N[0],
+                                                  ldd[0],
+                                                  hD_gold[0].buf(),
+                                                  "batch_0_D_Gold_output.txt");
                 }
                 check(stream,
                       arg,
@@ -4199,6 +4295,25 @@ void testing_matmul_with_bias(const Arguments& arg,
         CHECK_HIP_ERROR(hipFree(userArgs));
     if(d_userArgs != nullptr)
         CHECK_HIP_ERROR(hipFree(d_userArgs));
+
+    // Explicitly destroy opaque handles to avoid leaks.
+    for(auto& h : matA)
+        if(h)
+            (void)hipblasLtMatrixLayoutDestroy(h);
+    for(auto& h : matB)
+        if(h)
+            (void)hipblasLtMatrixLayoutDestroy(h);
+    for(auto& h : matC)
+        if(h)
+            (void)hipblasLtMatrixLayoutDestroy(h);
+    for(auto& h : matD)
+        if(h)
+            (void)hipblasLtMatrixLayoutDestroy(h);
+
+    for(auto& block : matmul)
+        for(auto& h : block)
+            if(h)
+                (void)hipblasLtMatmulDescDestroy(h);
 
     CHECK_HIP_ERROR(hipStreamDestroy(stream));
 }
