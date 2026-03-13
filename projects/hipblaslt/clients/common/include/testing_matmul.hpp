@@ -3821,29 +3821,13 @@ void testing_matmul_with_bias(const Arguments& arg,
         double flush_time_used = 0;
         if(arg.flush && (!arg.use_gpu_timer || !arg.remove_outliers))
         {
-            static std::unordered_map<std::string, double> flush_times_cache;
-            static std::mutex                              mtx;
-            std::lock_guard<std::mutex>                    lock(mtx);
-            std::string                                    device_uuid(deviceProps.uuid.bytes);
-            if(!flush_times_cache.count(device_uuid))
-            {
-                for(int i = 0; i < flush_iter; i++)
-                    hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
-                pre_gpu_time(arg.use_gpu_timer, event_gpu_time_start, flush_time_used, stream);
-                for(int i = 0; i < flush_iter; i++)
-                    hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
-                post_gpu_time(arg.use_gpu_timer,
-                              event_gpu_time_start,
-                              event_gpu_time_end,
-                              flush_time_used,
-                              stream);
-                flush_time_used /= flush_iter;
-                flush_times_cache[device_uuid] = flush_time_used;
-            }
-            else
-            {
-                flush_time_used = flush_times_cache[device_uuid];
-            }
+            for(int i = 0; i < flush_iter; i++)
+                hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
+            flush_time_used = get_time_us_sync(stream);
+            for(int i = 0; i < flush_iter; i++)
+                hipLaunchKernelGGL(flush_icache, dim3(gpu_block3), dim3(64), 0, stream);
+            flush_time_used = get_time_us_sync(stream) - flush_time_used;
+            flush_time_used /= flush_iter;
         }
 
         auto copy_to_host = [&](int i) {
@@ -3904,7 +3888,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                     {
                         continue;
                     }
-                    perf_monitor.start();
+                    perf_monitor->start();
                     timing_loop(arg.use_gpu_timer,
                                 arg.remove_outliers,
                                 number_hot_calls,
@@ -3913,7 +3897,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                                 flush,
                                 gpu_time_used,
                                 stream);
-                    perf_monitor.stop();
+                    perf_monitor->stop();
                 }
                 else
                 {
@@ -3961,7 +3945,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                             continue;
                         
                     }
-                    perf_monitor.start();
+                    perf_monitor->start();
                     timing_loop(arg.use_gpu_timer,
                                 arg.remove_outliers,
                                 number_hot_calls,
@@ -3970,7 +3954,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                                 flush,
                                 gpu_time_used,
                                 stream);
-                    perf_monitor.stop();
+                    perf_monitor->stop();
                 }
             }
             else
@@ -4012,7 +3996,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                     {
                         continue;
                     }
-                    perf_monitor.start();
+                    perf_monitor->start();
                     timing_loop(
                         arg.use_gpu_timer,
                         arg.remove_outliers,
@@ -4022,7 +4006,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                         [](int) {},
                         gpu_time_used,
                         stream);
-                    perf_monitor.stop();
+                    perf_monitor->stop();
                 }
                 else
                 {
@@ -4052,7 +4036,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                     {
                         continue;
                     }
-                    perf_monitor.start();
+                    perf_monitor->start();
                     timing_loop(
                         arg.use_gpu_timer,
                         arg.remove_outliers,
@@ -4062,7 +4046,7 @@ void testing_matmul_with_bias(const Arguments& arg,
                         [](int) {},
                         gpu_time_used,
                         stream);
-                    perf_monitor.stop();
+                    perf_monitor->stop();
                 }
             }
 
